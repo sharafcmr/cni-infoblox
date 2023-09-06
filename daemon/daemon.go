@@ -24,12 +24,19 @@ import (
 	"net/rpc"
 	"runtime"
 	"strings"
+	"os"
+	"context"
 
 	"github.com/containernetworking/cni/pkg/types"
 	"github.com/containernetworking/cni/pkg/types/current"
 	"github.com/containernetworking/plugins/pkg/utils/hwaddr"
 	. "github.com/infobloxopen/cni-infoblox"
 	ibclient "github.com/infobloxopen/infoblox-go-client"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"kubevirt.io/client-go/kubecli"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 )
 
 type Infoblox struct {
@@ -63,26 +70,29 @@ func (ib *Infoblox) Allocate(args *ExtCmdArgs, result *current.Result) (err erro
 
 	cidr := net.IPNet{IP: conf.IPAM.Subnet.IP, Mask: conf.IPAM.Subnet.Mask}
 	netviewName := conf.IPAM.NetworkView
-	gw := conf.IPAM.Gateway
+	netCreateCheck := os.Getenv("CHECK_NETWORK")
+	// Create network only if CHECK_NETWORK environment varible is not defined or set as true
+	subnet := cidr.String()
 	log.Printf("RequestNetwork: '%s', '%s'", netviewName, cidr.String())
-	netview, _ := ib.Drv.RequestNetworkView(netviewName)
-	if netview == "" {
-		return nil
-	}
+	if len(netCreateCheck) == 0 ||  os.Getenv("CHECK_NETWORK") == "true" {
+			gw := conf.IPAM.Gateway
+			netview, _ := ib.Drv.RequestNetworkView(netviewName)
+			if netview == "" {
+				return nil
+			}
+			subnet, _ := ib.Drv.RequestNetwork(conf, netview)
+			if subnet == "" {
+				return nil
+			}
 
-	subnet, _ := ib.Drv.RequestNetwork(conf, netview)
-	if subnet == "" {
-		return nil
+			//cni is not calling gateway creation call, so it is implemented here
+			//if gateway is not provided in net conf file by customer, it wont create as for now
+			if gw != nil {
+				if _, err := ib.Drv.CreateGateway(subnet, gw, netviewName); err != nil {
+					return fmt.Errorf("error creating gateway:%v", err)
+				}
+			}
 	}
-
-	//cni is not calling gateway creation call, so it is implemented here
-	//if gateway is not provided in net conf file by customer, it wont create as for now
-	if gw != nil {
-		if _, err := ib.Drv.CreateGateway(subnet, gw, netviewName); err != nil {
-			return fmt.Errorf("error creating gateway:%v", err)
-		}
-	}
-
 	mac := args.IfMac
 
 	return ib.requestAddress(conf, args, result, netviewName, subnet, mac)
@@ -176,6 +186,57 @@ func getListener(driverSocket *DriverSocket) (net.Listener, error) {
 
 	return net.Listen("unix", socketFile)
 }
+// For kubevirt virtual machine launcher pods the infoblox IP release should happen only when the VM gets delete
+// The kubevirt launcher pods gets deleted everytime when we stop/restart/migrate a VirtualMachine resource
+// The method will extract the VM name from the pod object using the label, And then make a query to virtAPI to
+// check if VM exists or not, the Release method will not be called if the VM object exists for the pod
+func (ib *Infoblox) CheckVM(args *ExtCmdArgs, result *string) error {
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		panic(err.Error())
+	}
+	// creates the clientset
+	k8sClient, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		panic(err.Error())
+	}
+	kvClient, err := kubecli.GetKubevirtClientFromRESTConfig(config)
+	if err != nil {
+		panic(err.Error())
+	}
+
+	podName := ""
+	podNamespace := ""
+	str1 := strings.Split(args.Args, "K8S_POD_NAME=")
+	if len(str1) != 1 {
+		str2 := strings.Split(str1[1], ";")
+		podName = str2[0]
+	}
+	nsstr1 := strings.Split(args.Args, "K8S_POD_NAMESPACE=")
+	if len(nsstr1) != 1 {
+		nsstr2 := strings.Split(nsstr1[1], ";")
+		podNamespace = nsstr2[0]
+	}
+	// Get the pod object using the podname and namespace name provided in the args
+	pod, err := k8sClient.CoreV1().Pods(podNamespace).Get(context.TODO(), podName, metav1.GetOptions{})
+	if err != nil {
+		///		return err
+		panic(err.Error())
+	}
+	log.Printf("Launcher pod: '%s'", pod)
+	// Check the value of label
+	vmname := pod.Labels["kubevirt.io/vm"]
+	log.Printf("vmname: '%s'", vmname)
+	// Get VM object using the label value
+	vm, err := kvClient.VirtualMachine(podNamespace).Get(vmname, &metav1.GetOptions{})
+	if err != nil {
+		panic(err.Error())
+	}
+	log.Printf("vmname: '%s'", vm)
+
+	return nil
+}
+
 
 func getInfobloxDriver(config *Config) *InfobloxDriver {
 	hostConfig := ibclient.HostConfig{
@@ -197,7 +258,7 @@ func getInfobloxDriver(config *Config) *InfobloxDriver {
 		requestBuilder, requestor)
 
 	objMgr := ibclient.NewObjectManager(conn, "Kubernetes", config.ClusterName)
-	CheckForCloudLicense(objMgr)
+	//CheckForCloudLicense(objMgr)
 	return NewInfobloxDriver(objMgr, config.NetworkView, config.NetworkContainer, config.PrefixLength)
 }
 

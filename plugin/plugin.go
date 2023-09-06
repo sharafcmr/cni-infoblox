@@ -22,6 +22,7 @@ import (
 	"net/rpc"
 	"path/filepath"
 	"sync"
+	"strings"
 
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
@@ -97,15 +98,18 @@ func cmdAdd(args *skel.CmdArgs) error {
 }
 
 func cmdDel(args *skel.CmdArgs) error {
-	result := struct{}{}
+	var result string
 	extArgs := &ExtCmdArgs{CmdArgs: *args}
-
-	mac := getMacAddress(args.Netns, args.IfName)
-	extArgs.IfMac = mac
-	if err := rpcCall("Infoblox.Release", extArgs, &result); err != nil {
-		return fmt.Errorf("error dialing Infoblox daemon: %v", err)
+	errChkVm := rpcCall("Infoblox.CheckVM", extArgs, &result)
+	fmt.Errorf("Prinitng returned data: %v",  errChkVm)
+	if strings.Contains(result, "kubevirt.io/vm") {
+		mac := getMacAddress(args.Netns, args.IfName)
+		extArgs.IfMac = mac
+		if err := rpcCall("Infoblox.Release", extArgs, &result); err != nil {
+			 return fmt.Errorf("error dialing Infoblox daemon: %v", err)
+		}
+		return nil
 	}
-
 	return nil
 }
 
